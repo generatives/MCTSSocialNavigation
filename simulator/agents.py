@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from mcts.decoupled_mcts import MCTS
+from simulator.mcts_game_state import MCTSGameState, navigation_rollout
+
 from .constants import WALL
 from .map import ScenarioMap
 from .pathfinding import a_star
@@ -113,11 +116,13 @@ class RobotAI:
         robot.command_v = float(np.clip(1.8 * distance * speed_scale, 0.0, robot.max_speed))
 
 class MCTSRobotAI:
-    def __init__(self, scenario: ScenarioMap, replan_period: float = 0.50):
+    def __init__(self, scenario: ScenarioMap, crowd: Crowd, replan_period: float = 0.50):
         self.scenario = scenario
+        self.crowd = crowd
         self.replan_period = replan_period
         self.replan_timer = 0.0
         self.manual_goal: tuple[int, int] | None = None
+        self.intermediate_goal = tuple[float, float] | None = None
 
     def set_manual_goal(self, cell: tuple[int, int]) -> None:
         self.manual_goal = cell
@@ -126,6 +131,52 @@ class MCTSRobotAI:
     def clear_manual_goal(self) -> None:
         self.manual_goal = None
         self.replan_timer = 0.0
+
+    def _plan_intermediate_goal(self, robot: Robot) -> tuple[float, float]:
+        num_humans = 5
+        num_agents = num_humans + 1
+        num_actions = 3
+        tree_depth = 6
+        mcts = MCTS(navigation_rollout, tree_depth, num_actions)
+        dt = 0.5
+        human_speed = 1.7
+        
+        agent_distances = np.linalg.norm(robot.position - self.crowd.positions)
+        sorted_indices = np.argsort(agent_distances)
+        closest_humans = sorted_indices[:num_humans + 1]
+
+        human_positions = self.crowd.positions[closest_humans]
+        human_velocities = self.crowd.velocities[closest_humans]
+        human_orientations = np.arctan2(human_velocities[1], human_velocities[0])
+        human_goals = human_positions + human_velocities * (human_speed * dt * tree_depth)
+
+        positions = np.vstack([
+            robot.position,
+            human_positions
+        ])
+        orientations = np.vstack([
+            robot.theta,
+            human_orientations
+        ])
+        goal_positions = np.vstack([
+            self.scenario.cell_to_world(self.manual_goal),
+            human_goals
+        ])
+
+        root_state = MCTSGameState(
+            positions=positions,
+            orientations=orientations,
+            agent_goal_positions=goal_positions,
+            num_actors=num_agents,
+            num_actions=num_actions,
+            movement_distance=human_speed * dt,
+            angle=np.pi / 4.0,
+            map=self.scenario,
+            depth=0
+        )
+        best_actions, child_state = mcts.search(root_state, 100)
+
+        return child_state.positions[0]
 
     def update(self, robot: Robot, dt: float) -> None:
         self.replan_timer -= dt
@@ -148,29 +199,16 @@ class MCTSRobotAI:
             robot.command_v = 0.0
             robot.command_w = 0.0
             return
-
-        if self.replan_timer <= 0.0 or not robot.path:
+        
+        if self.replan_timer <= 0.0 or not self.intermediate_goal or np.linalg.norm(robot.position - self.intermediate_goal) < 0.35:
             self.replan_timer = self.replan_period
-            new_path = a_star(self.scenario.grid, free_robot_cell, goal)
-            if new_path:
-                robot.path = new_path
-                robot.path_ptr = 1 if len(new_path) > 1 else 0
+            self.intermediate_goal = self._plan_intermediate_goal()
 
-        if not robot.path or robot.path_ptr >= len(robot.path):
-            robot.command_v = 0.0
-            robot.command_w = 0.0
-            return
+        target_disp = self.intermediate_goal - robot.position
 
-        target_world = self.scenario.cell_to_world(robot.path[robot.path_ptr])
-        to_target = target_world - robot.position
-        if np.linalg.norm(to_target) < 0.35 and robot.path_ptr < len(robot.path) - 1:
-            robot.path_ptr += 1
-            target_world = self.scenario.cell_to_world(robot.path[robot.path_ptr])
-            to_target = target_world - robot.position
-
-        desired_heading = math.atan2(float(to_target[1]), float(to_target[0]))
+        desired_heading = math.atan2(float(target_disp[1]), float(target_disp[0]))
         heading_error = (desired_heading - robot.theta + math.pi) % (2.0 * math.pi) - math.pi
-        distance = np.linalg.norm(to_target)
+        distance = np.linalg.norm(target_disp)
 
         robot.command_w = float(np.clip(2.3 * heading_error, -robot.max_omega, robot.max_omega))
         speed_scale = max(0.0, 1.0 - abs(heading_error) / math.pi)

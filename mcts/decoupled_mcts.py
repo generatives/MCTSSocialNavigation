@@ -114,7 +114,7 @@ class MCTS:
         heuristic_fn: Optional[HeuristicFn] = None,
         *,
         c_puct: float = 1.4,
-        max_depth: int = 10_000,
+        max_depth: int = 6,
         rng: Optional[random.Random] = None,
     ) -> None:
         self.rollout_fn = rollout_fn
@@ -130,7 +130,7 @@ class MCTS:
         root_state: GameStateProtocol,
         *,
         num_simulations: int,
-    ) -> Tuple[Action, Dict[Action, float]]:
+    ) -> Tuple[Action, GameStateProtocol]:
         #print("Starting search")
         root = _Node(root_state, None, self.num_actors, self.num_actions)
 
@@ -154,13 +154,17 @@ class MCTS:
             self._backpropagate(node, values)
             #print(f"Completed simulation {i}")
 
-        best = self._best_action(root)
-        stats = {child.action: child.visits for child in root._children}
-        return best, stats
+        best_actions = self._best_actions(root)
+        child_state = root.get_child(best_actions)
+        return best_actions, child_state
 
-    def _best_action(self, root: _Node, actor: int) -> Action:
-        action, visits = max(enumerate(root.visits_by_action[actor]), key=lambda t: t[1])
-        return action
+    def _best_actions(self, root: _Node) -> Action:
+        actions = []
+        for actor in range(self.num_actors):
+            action, visits = max(enumerate(root.visits_by_action[actor]), key=lambda t: t[1])
+            actions.append(action)
+
+        return actions
 
     def _select_child(self, node: _Node) -> _Node:
         player = node.state.current_player()
